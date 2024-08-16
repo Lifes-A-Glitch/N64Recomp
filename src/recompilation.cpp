@@ -18,6 +18,92 @@ std::string_view ctx_gpr_prefix(int reg) {
     return "";
 }
 
+enum class JalResolutionResult {
+    NoMatch,
+    Match,
+    CreateStatic,
+    Ambiguous,
+    Error
+};
+
+JalResolutionResult resolve_jal(const RecompPort::Context& context, size_t cur_section_index, uint32_t target_func_vram, size_t& matched_function_index) {
+    // Look for symbols with the target vram address
+    const RecompPort::Section& cur_section = context.sections[cur_section_index];
+    const auto matching_funcs_find = context.functions_by_vram.find(target_func_vram);
+    uint32_t section_vram_start = cur_section.ram_addr;
+    uint32_t section_vram_end = cur_section.ram_addr + cur_section.size;
+    bool in_current_section = target_func_vram >= section_vram_start && target_func_vram < section_vram_end;
+    bool needs_static = false;
+    bool exact_match_found = false;
+
+    // Use a thread local to prevent reallocation across runs and to allow multi-threading in the future.
+    thread_local std::vector<size_t> matched_funcs{};
+    matched_funcs.clear();
+
+    // Evaluate any functions with the target address to see if they're potential candidates for JAL resolution.
+    if (matching_funcs_find != context.functions_by_vram.end()) {
+        for (size_t target_func_index : matching_funcs_find->second) {
+            const auto& target_func = context.functions[target_func_index];
+
+            // Zero-sized symbol handling. unless there's only one matching target.
+            if (target_func.words.empty()) {
+                // Allow zero-sized symbols between 0x8F000000 and 0x90000000 for use with patches.
+                // TODO make this configurable or come up with a more sensible solution for dealing with manual symbols for patches.
+                if (target_func.vram < 0x8F000000 || target_func.vram > 0x90000000) {
+                    continue;
+                }
+            }
+
+            // Immediately accept a function in the same section as this one, since it must also be loaded if the current function is.
+            if (target_func.section_index == cur_section_index) {
+                exact_match_found = true;
+                matched_funcs.clear();
+                matched_funcs.push_back(target_func_index);
+                break;
+            }
+
+            // If the function's section isn't relocatable, add the function as a candidate.
+            const auto& target_func_section = context.sections[target_func.section_index];
+            if (!target_func_section.relocatable) {
+                matched_funcs.push_back(target_func_index);
+            }
+        }
+    }
+
+    // If the target vram is in the current section, only allow exact matches.
+    if (in_current_section) {
+        // If an exact match was found, use it.
+        if (exact_match_found) {
+            matched_function_index = matched_funcs[0];
+            return JalResolutionResult::Match;
+        }
+        // Otherwise, create a static function at the target address.
+        else {
+            return JalResolutionResult::CreateStatic;
+        }
+    }
+    // Otherwise, disambiguate based on the matches found.
+    else {
+        // If there were no matches then JAL resolution has failed.
+        // A static can't be created as the target section is unknown.
+        if (matched_funcs.size() == 0) {
+            return JalResolutionResult::NoMatch;
+        }
+        // If there was an exact match, use it.
+        else if (matched_funcs.size() == 1) {
+            matched_function_index = matched_funcs[0];
+            return JalResolutionResult::Match;
+        }
+        // If there's more than one match, use an indirect jump to resolve the function at runtime.
+        else {
+            return JalResolutionResult::Ambiguous;
+        }
+    }
+
+    // This should never be hit, so return an error.
+    return JalResolutionResult::Error;
+}
+
 // Major TODO, this function grew very organically and needs to be cleaned up. Ideally, it'll get split up into some sort of lookup table grouped by similar instruction types.
 bool process_instruction(const RecompPort::Context& context, const RecompPort::Config& config, const RecompPort::Function& func, const RecompPort::FunctionStats& stats, const std::unordered_set<uint32_t>& skipped_insns, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ofstream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, std::span<std::vector<uint32_t>> static_funcs_out) {
     const auto& section = context.sections[func.section_index];
@@ -136,7 +222,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
             if (reloc_index + 1 < section.relocs.size() && next_vram > section.relocs[reloc_index].address) {
                 next_reloc_index++;
             }
-            process_instruction(context, config, func, stats, skipped_insns, instr_index + 1, instructions, output_file, false, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, static_funcs_out);
+            if (!process_instruction(context, config, func, stats, skipped_insns, instr_index + 1, instructions, output_file, false, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, static_funcs_out)) {
+                return false;
+            }
         }
         print_indent();
         fmt::vprint(output_file, fmt_str, fmt::make_format_args(args...));
@@ -145,12 +233,13 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
         } else {
             fmt::print(output_file, ";\n");
         }
+        return true;
     };
 
     auto print_func_call = [reloc_target_section_offset, reloc_reference_symbol, reloc_type, &context, &section, &func, &static_funcs_out, &needs_link_branch, &print_unconditional_branch]
         (uint32_t target_func_vram, bool link_branch = true, bool indent = false)
     {
-        std::string jal_target_name;
+        std::string jal_target_name{};
         if (reloc_reference_symbol != (size_t)-1) {
             const auto& ref_symbol = context.reference_symbols[reloc_reference_symbol];
             const std::string& ref_symbol_name = context.reference_symbol_names[reloc_reference_symbol];
@@ -168,69 +257,31 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
             jal_target_name = ref_symbol_name;
         }
         else {
-            const auto matching_funcs_find = context.functions_by_vram.find(target_func_vram);
-            uint32_t section_vram_start = section.ram_addr;
-            uint32_t section_vram_end = section.ram_addr + section.size;
-            // TODO the current section should be prioritized if the target jal is in its vram even if a function isn't known (i.e. static)
-            if (matching_funcs_find != context.functions_by_vram.end()) {
-                // If we found matches for the target function by vram, 
-                const auto& matching_funcs_vec = matching_funcs_find->second;
-                size_t real_func_index;
-                bool ambiguous;
-                // If there is more than one corresponding function, look for any that have a nonzero size.
-                if (matching_funcs_vec.size() > 1) {
-                    size_t nonzero_func_index = (size_t)-1;
-                    bool found_nonzero_func = false;
-                    for (size_t cur_func_index : matching_funcs_vec) {
-                        const auto& cur_func = context.functions[cur_func_index];
-                        if (cur_func.words.size() != 0) {
-                            if (found_nonzero_func) {
-                                ambiguous = true;
-                                break;
-                            }
-                            // If this section is relocatable and the target vram is in the section, don't call functions
-                            // in any section other than this one.
-                            if (cur_func.section_index == func.section_index ||
-                                !(section.relocatable && target_func_vram >= section_vram_start && target_func_vram < section_vram_end)) {
-                                found_nonzero_func = true;
-                                nonzero_func_index = cur_func_index;
-                            }
-                        }
-                    }
-                    if (nonzero_func_index == (size_t)-1) {
-                        fmt::print(stderr, "[Warn] Potential jal resolution ambiguity\n");
-                        for (size_t cur_func_index : matching_funcs_vec) {
-                            fmt::print(stderr, "  {}\n", context.functions[cur_func_index].name);
-                        }
-                        nonzero_func_index = 0;
-                    }
-                    real_func_index = nonzero_func_index;
-                    ambiguous = false;
-                }
-                else {
-                    real_func_index = matching_funcs_vec.front();
-                    ambiguous = false;
-                }
-                if (ambiguous) {
-                    fmt::print(stderr, "Ambiguous jal target: 0x{:08X}\n", target_func_vram);
-                    for (size_t cur_func_index : matching_funcs_vec) {
-                        const auto& cur_func = context.functions[cur_func_index];
-                        fmt::print(stderr, "  {}\n", cur_func.name);
-                    }
-                    return false;
-                }
-                jal_target_name = context.functions[real_func_index].name;
-            }
-            else {
-                const auto& section = context.sections[func.section_index];
-                if (target_func_vram >= section.ram_addr && target_func_vram < section.ram_addr + section.size) {
-                    jal_target_name = fmt::format("static_{}_{:08X}", func.section_index, target_func_vram);
-                    static_funcs_out[func.section_index].push_back(target_func_vram);
-                }
-                else {
+            size_t matched_func_index = 0;
+            JalResolutionResult jal_result = resolve_jal(context, func.section_index, target_func_vram, matched_func_index);
+
+            switch (jal_result) {
+                case JalResolutionResult::NoMatch:
                     fmt::print(stderr, "No function found for jal target: 0x{:08X}\n", target_func_vram);
                     return false;
-                }
+                case JalResolutionResult::Match:
+                    jal_target_name = context.functions[matched_func_index].name;
+                    break;
+                case JalResolutionResult::CreateStatic:
+                    // Create a static function add it to the static function list for this section.
+                    jal_target_name = fmt::format("static_{}_{:08X}", func.section_index, target_func_vram);
+                    static_funcs_out[func.section_index].push_back(target_func_vram);
+                    break;
+                case JalResolutionResult::Ambiguous:
+                    fmt::print(stderr, "[Info] Ambiguous jal target 0x{:08X} in function {}, falling back to function lookup\n", target_func_vram, func.name);
+                    // Relocation isn't necessary for jumps inside a relocatable section, as this code path will never run if the target vram
+                    // is in the current function's section (see the branch for `in_current_section` above).
+                    // If a game ever needs to jump between multiple relocatable sections, relocation will be necessary here.
+                    jal_target_name = fmt::format("LOOKUP_FUNC(0x{:08X})", target_func_vram);
+                    break;
+                case JalResolutionResult::Error:
+                    fmt::print(stderr, "Internal error when resolving jal to address 0x{:08X} in function {}\n", target_func_vram, func.name);
+                    return false;
             }
         }
         needs_link_branch = link_branch;
@@ -248,10 +299,12 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
             if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
                 fmt::print(output_file, "{{\n    ");
                 fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
-                print_func_call(branch_target, false, true);
+                if (!print_func_call(branch_target, false, true)) {
+                    return false;
+                }
                 print_line("    return");
                 fmt::print(output_file, "    }}\n");
-                return;
+                return true;
             }
 
             fmt::print(stderr, "[Warn] Function {} is branching outside of the function (to 0x{:08X})\n", func.name, branch_target);
@@ -266,7 +319,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
             if (reloc_index + 1 < section.relocs.size() && next_vram > section.relocs[reloc_index].address) {
                 next_reloc_index++;
             }
-            process_instruction(context, config, func, stats, skipped_insns, instr_index + 1, instructions, output_file, true, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, static_funcs_out);
+            if (!process_instruction(context, config, func, stats, skipped_insns, instr_index + 1, instructions, output_file, true, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, static_funcs_out)) {
+                return false;
+            }
         }
 
         fmt::print(output_file, "        ");
@@ -275,6 +330,7 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
             fmt::print(output_file, ";\n        goto after_{}", link_branch_index);
         }
         fmt::print(output_file, ";\n    }}\n");
+        return true;
     };
 
     if (indent) {
@@ -577,7 +633,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
 
     // Branches
     case InstrId::cpu_jal:
-        print_func_call(instr.getBranchVramGeneric());
+        if (!print_func_call(instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_jalr:
         // jalr can only be handled with $ra as the return address register
@@ -613,7 +671,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
             // FIXME: how to deal with static functions?
             else if (context.functions_by_vram.find(branch_target) != context.functions_by_vram.end()) {
                 fmt::print("Tail call in {} to 0x{:08X}\n", func.name, branch_target);
-                print_func_call(branch_target, false);
+                if (!print_func_call(branch_target, false)) {
+                    return false;
+                }
                 print_line("return");
             }
             else {
@@ -639,7 +699,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
                 if (reloc_index + 1 < section.relocs.size() && next_vram > section.relocs[reloc_index].address) {
                     next_reloc_index++;
                 }
-                process_instruction(context, config, func, stats, skipped_insns, instr_index + 1, instructions, output_file, false, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, static_funcs_out);
+                if (!process_instruction(context, config, func, stats, skipped_insns, instr_index + 1, instructions, output_file, false, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, static_funcs_out)) {
+                    return false;
+                }
                 print_indent();
                 fmt::print(output_file, "switch (jr_addend_{:08X} >> 2) {{\n", cur_jtbl.jr_vram);
                 for (size_t entry_index = 0; entry_index < cur_jtbl.entries.size(); entry_index++) {
@@ -687,7 +749,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bne:
         print_indent();
         print_branch_condition("if ({}{} != {}{})", ctx_gpr_prefix(rs), rs, ctx_gpr_prefix(rt), rt);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_beql:
         is_branch_likely = true;
@@ -695,7 +759,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_beq:
         print_indent();
         print_branch_condition("if ({}{} == {}{})", ctx_gpr_prefix(rs), rs, ctx_gpr_prefix(rt), rt);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_bgezl:
         is_branch_likely = true;
@@ -703,7 +769,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bgez:
         print_indent();
         print_branch_condition("if (SIGNED({}{}) >= 0)", ctx_gpr_prefix(rs), rs);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_bgtzl:
         is_branch_likely = true;
@@ -711,7 +779,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bgtz:
         print_indent();
         print_branch_condition("if (SIGNED({}{}) > 0)", ctx_gpr_prefix(rs), rs);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_blezl:
         is_branch_likely = true;
@@ -719,7 +789,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_blez:
         print_indent();
         print_branch_condition("if (SIGNED({}{}) <= 0)", ctx_gpr_prefix(rs), rs);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_bltzl:
         is_branch_likely = true;
@@ -727,7 +799,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bltz:
         print_indent();
         print_branch_condition("if (SIGNED({}{}) < 0)", ctx_gpr_prefix(rs), rs);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_break:
         print_line("do_break({})", instr_vram);
@@ -738,7 +812,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bgezal:
         print_indent();
         print_branch_condition("if (SIGNED({}{}) >= 0) {{", ctx_gpr_prefix(rs), rs);
-        print_func_call(instr.getBranchVramGeneric());
+        if (!print_func_call(instr.getBranchVramGeneric())) {
+            return false;
+        }
         print_line("}}");
         break;
 
@@ -908,7 +984,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bc1t:
         print_indent();
         print_branch_condition("if (c1cs)", ctx_gpr_prefix(rs), rs);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
     case InstrId::cpu_bc1fl:
         is_branch_likely = true;
@@ -916,7 +994,9 @@ bool process_instruction(const RecompPort::Context& context, const RecompPort::C
     case InstrId::cpu_bc1f:
         print_indent();
         print_branch_condition("if (!c1cs)", ctx_gpr_prefix(rs), rs);
-        print_branch((uint32_t)instr.getBranchVramGeneric());
+        if (!print_branch((uint32_t)instr.getBranchVramGeneric())) {
+            return false;
+        }
         break;
 
     // Cop1 arithmetic
@@ -1160,12 +1240,13 @@ bool RecompPort::recompile_function(const RecompPort::Context& context, const Re
     if (write_header) {
         // Write the file header
         fmt::print(output_file,
-            "#include \"librecomp/recomp.h\"\n"
-            "\n");
+            "{}\n"
+            "\n",
+            config.recomp_include);
     }
 
     fmt::print(output_file,
-        "void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
+        "RECOMP_FUNC void {}(uint8_t* rdram, recomp_context* ctx) {{\n"
         // these variables shouldn't need to be preserved across function boundaries, so make them local for more efficient output
         "    uint64_t hi = 0, lo = 0, result = 0;\n"
         "    unsigned int rounding_mode = DEFAULT_ROUNDING_MODE;\n"

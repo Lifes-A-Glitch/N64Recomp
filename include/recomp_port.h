@@ -64,6 +64,7 @@ namespace RecompPort {
 
     struct Config {
         int32_t entrypoint;
+        int32_t functions_per_output_file;
         bool has_entrypoint;
         bool uses_mips3_float_mode;
         bool single_file_output;
@@ -85,6 +86,7 @@ namespace RecompPort {
         std::vector<FunctionSize> manual_func_sizes;
         std::vector<ManualFunction> manual_functions;
         std::string bss_section_suffix;
+        std::string recomp_include;
 
         Config(const char* path);
         bool good() { return !bad; }
