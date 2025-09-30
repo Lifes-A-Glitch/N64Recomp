@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <vector>
+#include <unordered_map>
 
 namespace N64Recomp {
     struct InstructionPatch {
@@ -12,7 +13,7 @@ namespace N64Recomp {
         uint32_t value;
     };
 
-    struct FunctionHook {
+    struct FunctionTextHook {
         std::string func_name;
         int32_t before_vram;
         std::string text;
@@ -42,6 +43,8 @@ namespace N64Recomp {
         bool single_file_output;
         bool use_absolute_symbols;
         bool unpaired_lo16_warnings;
+        bool use_mdebug;
+        bool trace_mode;
         bool allow_exports;
         bool strict_patch_mode;
         std::filesystem::path elf_path;
@@ -54,12 +57,18 @@ namespace N64Recomp {
         std::filesystem::path output_binary_path;
         std::vector<std::string> stubbed_funcs;
         std::vector<std::string> ignored_funcs;
+        std::vector<std::string> renamed_funcs;
         std::vector<InstructionPatch> instruction_patches;
-        std::vector<FunctionHook> function_hooks;
+        std::vector<FunctionTextHook> function_hooks;
         std::vector<FunctionSize> manual_func_sizes;
         std::vector<ManualFunction> manual_functions;
         std::string bss_section_suffix;
         std::string recomp_include;
+        // Manual mappings of mdebug file records to elf sections.
+        std::unordered_map<std::string, std::string> mdebug_text_map;
+        std::unordered_map<std::string, std::string> mdebug_data_map;
+        std::unordered_map<std::string, std::string> mdebug_rodata_map;
+        std::unordered_map<std::string, std::string> mdebug_bss_map;
 
         Config(const char* path);
         bool good() { return !bad; }

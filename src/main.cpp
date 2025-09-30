@@ -9,7 +9,7 @@
 #include "fmt/format.h"
 #include "fmt/ostream.h"
 
-#include "n64recomp.h"
+#include "recompiler/context.h"
 #include "config.h"
 #include <set>
 
@@ -111,7 +111,7 @@ bool compare_files(const std::filesystem::path& file1_path, const std::filesyste
     return std::equal(begin1, std::istreambuf_iterator<char>(), begin2); //Second argument is end-of-range iterator
 }
 
-bool recompile_single_function(const N64Recomp::Context& context, const N64Recomp::Function& func, const std::string& recomp_include, const std::filesystem::path& output_path, std::span<std::vector<uint32_t>> static_funcs_out) {
+bool recompile_single_function(const N64Recomp::Context& context, size_t func_index, const std::string& recomp_include, const std::filesystem::path& output_path, std::span<std::vector<uint32_t>> static_funcs_out) {
     // Open the temporary output file
     std::filesystem::path temp_path = output_path;
     temp_path.replace_extension(".tmp");
@@ -127,7 +127,7 @@ bool recompile_single_function(const N64Recomp::Context& context, const N64Recom
         "\n",
         recomp_include);
 
-    if (!N64Recomp::recompile_function(context, func, output_file, static_funcs_out, false)) {
+    if (!N64Recomp::recompile_function(context, func_index, output_file, static_funcs_out, false)) {
         return false;
     }
     
@@ -199,7 +199,7 @@ void dump_context(const N64Recomp::Context& context, const std::unordered_map<ui
                 for (const N64Recomp::Reloc& reloc : section.relocs) {
                     if (reloc.target_section == section_index || reloc.target_section == section.bss_section_index) {
                         // TODO allow emitting MIPS32 relocs for specific sections via a toml option for TLB mapping support.
-                        if (reloc.type == N64Recomp::RelocType::R_MIPS_HI16 || reloc.type == N64Recomp::RelocType::R_MIPS_LO16) {
+                        if (reloc.type == N64Recomp::RelocType::R_MIPS_HI16 || reloc.type == N64Recomp::RelocType::R_MIPS_LO16 || reloc.type == N64Recomp::RelocType::R_MIPS_26) {
                             fmt::print(func_context_file, "    {{ type = \"{}\", vram = 0x{:08X}, target_vram = 0x{:08X} }},\n",
                                 reloc_names[static_cast<int>(reloc.type)], reloc.address, reloc.target_section_offset + section.ram_addr);
                         }
@@ -272,12 +272,18 @@ int main(int argc, char** argv) {
         std::exit(EXIT_FAILURE);
     };
 
-    // TODO expose a way to dump the context from the command line.
-    bool dumping_context = false;
+    bool dumping_context;
 
-    if (argc != 2) {
-        fmt::print("Usage: {} [config file]\n", argv[0]);
-        std::exit(EXIT_SUCCESS);
+    if (argc >= 3) {
+        std::string arg2 = argv[2];
+        if (arg2 == "--dump-context") {
+            dumping_context = true;
+        } else {
+            fmt::print("Usage: {} <config file> [--dump-context]\n", argv[0]);
+            std::exit(EXIT_SUCCESS);
+        }
+    } else {
+        dumping_context = false;
     }
 
     const char* config_path = argv[1];
@@ -303,6 +309,9 @@ int main(int argc, char** argv) {
 
     std::unordered_set<std::string> relocatable_sections{};
     relocatable_sections.insert(relocatable_sections_ordered.begin(), relocatable_sections_ordered.end());
+
+    std::unordered_set<std::string> ignored_syms_set{};
+    ignored_syms_set.insert(config.ignored_funcs.begin(), config.ignored_funcs.end());
 
     N64Recomp::Context context{};
     
@@ -341,11 +350,17 @@ int main(int argc, char** argv) {
         N64Recomp::ElfParsingConfig elf_config {
             .bss_section_suffix = config.bss_section_suffix,
             .relocatable_sections = std::move(relocatable_sections),
+            .ignored_syms = std::move(ignored_syms_set),
+            .mdebug_text_map = config.mdebug_text_map,
+            .mdebug_data_map = config.mdebug_data_map,
+            .mdebug_rodata_map = config.mdebug_rodata_map,
+            .mdebug_bss_map = config.mdebug_bss_map,
             .has_entrypoint = config.has_entrypoint,
             .entrypoint_address = config.entrypoint,
             .use_absolute_symbols = config.use_absolute_symbols,
             .unpaired_lo16_warnings = config.unpaired_lo16_warnings,
             .all_sections_relocatable = false,
+            .use_mdebug = config.use_mdebug,
         };
 
         for (const auto& func_size : config.manual_func_sizes) {
@@ -353,7 +368,9 @@ int main(int argc, char** argv) {
         }
 
         bool found_entrypoint_func;
-        N64Recomp::Context::from_elf_file(config.elf_path, context, elf_config, dumping_context, data_syms, found_entrypoint_func);
+        if (!N64Recomp::Context::from_elf_file(config.elf_path, context, elf_config, dumping_context, data_syms, found_entrypoint_func)) {
+            exit_failure("Failed to parse elf\n");
+        }
 
         // Add any manual functions
         add_manual_functions(context, config.manual_functions);
@@ -485,9 +502,26 @@ int main(int argc, char** argv) {
             // This helps prevent typos in the config file or functions renamed between versions from causing issues.
             exit_failure(fmt::format("Function {} is set as ignored in the config file but does not exist!", ignored_func));
         }
-        // Mark the function as .
+        // Mark the function as ignored.
         context.functions[func_find->second].ignored = true;
     }
+
+    // Rename any functions specified in the config file.
+    for (const std::string& renamed_func : config.renamed_funcs) {
+        // Check if the specified function exists.
+        auto func_find = context.functions_by_name.find(renamed_func);
+        if (func_find == context.functions_by_name.end()) {
+            // Function doesn't exist, present an error to the user instead of silently failing to rename it.
+            // This helps prevent typos in the config file or functions renamed between versions from causing issues.
+            exit_failure(fmt::format("Function {} is set as renamed in the config file but does not exist!", renamed_func));
+        }
+        // Rename the function.
+        N64Recomp::Function* func = &context.functions[func_find->second];
+        func->name = func->name + "_recomp";
+    }
+
+    // Propogate the trace mode parameter.
+    context.trace_mode = config.trace_mode;
 
     // Apply any single-instruction patches.
     for (const N64Recomp::InstructionPatch& patch : config.instruction_patches) {
@@ -513,7 +547,7 @@ int main(int argc, char** argv) {
     }
 
     // Apply any function hooks.
-    for (const N64Recomp::FunctionHook& patch : config.function_hooks) {
+    for (const N64Recomp::FunctionTextHook& patch : config.function_hooks) {
         // Check if the specified function exists.
         auto func_find = context.functions_by_name.find(patch.func_name);
         if (func_find == context.functions_by_name.end()) {
@@ -623,6 +657,11 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
+                    // Ignore R_MIPS_NONE relocs, which get produced during symbol parsing for non-relocatable reference sections.
+                    if (reloc.type == N64Recomp::RelocType::R_MIPS_NONE) {
+                        continue;
+                    }
+
                     // Check if the reloc points to the event section.
                     if (reloc.target_section == event_section_index) {
                         // It does, so find the function it's pointing at.
@@ -702,7 +741,7 @@ int main(int argc, char** argv) {
 
             // Recompile the function.
             if (config.single_file_output || config.functions_per_output_file > 1) {
-                result = N64Recomp::recompile_function(context, func, current_output_file, static_funcs_by_section, false);
+                result = N64Recomp::recompile_function(context, i, current_output_file, static_funcs_by_section, false);
                 if (!config.single_file_output) {
                     cur_file_function_count++;
                     if (cur_file_function_count >= config.functions_per_output_file) {
@@ -711,7 +750,7 @@ int main(int argc, char** argv) {
                 }
             }
             else {
-                result = recompile_single_function(context, func, config.recomp_include, config.output_func_path / (func.name + ".c"), static_funcs_by_section);
+                result = recompile_single_function(context, i, config.recomp_include, config.output_func_path / (func.name + ".c"), static_funcs_by_section);
             }
             if (result == false) {
                 fmt::print(stderr, "Error recompiling {}\n", func.name);
@@ -774,22 +813,25 @@ int main(int argc, char** argv) {
             std::vector<uint32_t> insn_words((cur_func_end - static_func_addr) / sizeof(uint32_t));
             insn_words.assign(func_rom_start, func_rom_start + insn_words.size());
 
-            N64Recomp::Function func {
+            // Create the new function and add it to the context.
+            size_t new_func_index = context.functions.size();
+            context.functions.emplace_back(
                 static_func_addr,
                 rom_addr,
                 std::move(insn_words),
                 fmt::format("static_{}_{:08X}", section_index, static_func_addr),
                 static_cast<uint16_t>(section_index),
                 false
-            };
+            );
+            const N64Recomp::Function& new_func = context.functions[new_func_index];
 
             fmt::print(func_header_file,
-                       "void {}(uint8_t* rdram, recomp_context* ctx);\n", func.name);
+                       "void {}(uint8_t* rdram, recomp_context* ctx);\n", new_func.name);
 
             bool result;
-            size_t prev_num_statics = static_funcs_by_section[func.section_index].size();
+            size_t prev_num_statics = static_funcs_by_section[new_func.section_index].size();
             if (config.single_file_output || config.functions_per_output_file > 1) {
-                result = N64Recomp::recompile_function(context, func, current_output_file, static_funcs_by_section, false);
+                result = N64Recomp::recompile_function(context, new_func_index, current_output_file, static_funcs_by_section, false);
                 if (!config.single_file_output) {
                     cur_file_function_count++;
                     if (cur_file_function_count >= config.functions_per_output_file) {
@@ -798,14 +840,14 @@ int main(int argc, char** argv) {
                 }
             }
             else {
-                result = recompile_single_function(context, func, config.recomp_include, config.output_func_path / (func.name + ".c"), static_funcs_by_section);
+                result = recompile_single_function(context, new_func_index, config.recomp_include, config.output_func_path / (new_func.name + ".c"), static_funcs_by_section);
             }
 
             // Add any new static functions that were found while recompiling this one.
-            size_t cur_num_statics = static_funcs_by_section[func.section_index].size();
+            size_t cur_num_statics = static_funcs_by_section[new_func.section_index].size();
             if (cur_num_statics != prev_num_statics) {
                 for (size_t new_static_index = prev_num_statics; new_static_index < cur_num_statics; new_static_index++) {
-                    uint32_t new_static_vram = static_funcs_by_section[func.section_index][new_static_index];
+                    uint32_t new_static_vram = static_funcs_by_section[new_func.section_index][new_static_index];
 
                     if (!statics_set.contains(new_static_vram)) {
                         statics_set.emplace(new_static_vram);
@@ -815,7 +857,7 @@ int main(int argc, char** argv) {
             }
 
             if (result == false) {
-                fmt::print(stderr, "Error recompiling {}\n", func.name);
+                fmt::print(stderr, "Error recompiling {}\n", new_func.name);
                 std::exit(EXIT_FAILURE);
             }
         }
@@ -840,13 +882,6 @@ int main(int argc, char** argv) {
         );
     }
 
-    fmt::print(func_header_file,
-        "\n"
-        "#ifdef __cplusplus\n"
-        "}}\n"
-        "#endif\n"
-    );
-
     {
         std::ofstream overlay_file(config.output_func_path / "recomp_overlays.inl");
         std::string section_load_table = "static SectionTableEntry section_table[] = {\n";
@@ -865,6 +900,7 @@ int main(int argc, char** argv) {
         for (size_t section_index = 0; section_index < context.sections.size(); section_index++) {
             const auto& section = context.sections[section_index];
             const auto& section_funcs = context.section_functions[section_index];
+            const auto& section_relocs = section.relocs;
 
             if (section.has_mips32_relocs || !section_funcs.empty()) {
                 std::string_view section_name_trimmed{ section.name };
@@ -878,21 +914,66 @@ int main(int argc, char** argv) {
                 }
 
                 std::string section_funcs_array_name = fmt::format("section_{}_{}_funcs", section_index, section_name_trimmed);
+                std::string section_relocs_array_name = section_relocs.empty() ? "nullptr" : fmt::format("section_{}_{}_relocs", section_index, section_name_trimmed);
+                std::string section_relocs_array_size = section_relocs.empty() ? "0" : fmt::format("ARRLEN({})", section_relocs_array_name);
 
-                section_load_table += fmt::format("    {{ .rom_addr = 0x{0:08X}, .ram_addr = 0x{1:08X}, .size = 0x{2:08X}, .funcs = {3}, .num_funcs = ARRLEN({3}), .index = {4} }},\n",
-                                                  section.rom_addr, section.ram_addr, section.size, section_funcs_array_name, section_index);
+                // Write the section's table entry.
+                section_load_table += fmt::format("    {{ .rom_addr = 0x{0:08X}, .ram_addr = 0x{1:08X}, .size = 0x{2:08X}, .funcs = {3}, .num_funcs = ARRLEN({3}), .relocs = {4}, .num_relocs = {5}, .index = {6} }},\n",
+                                                  section.rom_addr, section.ram_addr, section.size, section_funcs_array_name,
+                                                  section_relocs_array_name, section_relocs_array_size, section_index);
 
+                // Write the section's functions.
                 fmt::print(overlay_file, "static FuncEntry {}[] = {{\n", section_funcs_array_name);
 
                 for (size_t func_index : section_funcs) {
                     const auto& func = context.functions[func_index];
+                    size_t func_size = func.reimplemented ? 0 : func.words.size() * sizeof(func.words[0]);
 
                     if (func.reimplemented || (!func.name.empty() && !func.ignored && func.words.size() != 0)) {
-                        fmt::print(overlay_file, "    {{ .func = {}, .offset = 0x{:08x} }},\n", func.name, func.rom - section.rom_addr);
+                        fmt::print(overlay_file, "    {{ .func = {}, .offset = 0x{:08X}, .rom_size = 0x{:08X} }},\n",
+                            func.name, func.rom - section.rom_addr, func_size);
                     }
                 }
 
                 fmt::print(overlay_file, "}};\n");
+
+                // Write the section's relocations.
+                if (!section_relocs.empty()) {
+                    // Determine if reference symbols are being used.
+                    bool reference_symbol_mode = !config.func_reference_syms_file_path.empty();
+
+                    fmt::print(overlay_file, "static RelocEntry {}[] = {{\n", section_relocs_array_name);
+
+                    for (const N64Recomp::Reloc& reloc : section_relocs) {
+                        bool emit_reloc = false;
+                        uint16_t target_section = reloc.target_section;
+                        // In reference symbol mode, only emit relocations into the table that point to
+                        // non-absolute reference symbols, events, or manual patch symbols.
+                        if (reference_symbol_mode) {
+                            bool manual_patch_symbol = N64Recomp::is_manual_patch_symbol(reloc.target_section_offset);
+                            bool is_absolute = reloc.target_section == N64Recomp::SectionAbsolute;
+                            emit_reloc = (reloc.reference_symbol && !is_absolute) || target_section == N64Recomp::SectionEvent || manual_patch_symbol;
+                        }
+                        // Otherwise, emit all relocs.
+                        else {
+                            emit_reloc = true;
+                        }
+                        if (emit_reloc) {
+                            uint32_t target_section_offset;
+                            if (reloc.target_section == N64Recomp::SectionEvent) {
+                                target_section_offset = reloc.symbol_index;
+                            }
+                            else {
+                                target_section_offset = reloc.target_section_offset;
+                            }
+                            fmt::print(overlay_file, "    {{ .offset = 0x{:08X}, .target_section_offset = 0x{:08X}, .target_section = {}, .type = {} }}, \n",
+                                reloc.address - section.ram_addr, target_section_offset, reloc.target_section, reloc_names[static_cast<size_t>(reloc.type)] );
+                        }
+                    }
+
+                    fmt::print(overlay_file, "}};\n");
+                }
+
                 written_sections++;
             }
         }
@@ -956,8 +1037,44 @@ int main(int argc, char** argv) {
             // Add a dummy element at the end to ensure the array has a valid length because C doesn't allow zero-size arrays.
             fmt::print(overlay_file, "    NULL\n");
             fmt::print(overlay_file, "}};\n");
+
+            // Collect manual patch symbols.
+            std::vector<std::pair<uint32_t, std::string>> manual_patch_syms{};
+
+            for (const auto& func : context.functions) {
+                if (func.words.empty() && N64Recomp::is_manual_patch_symbol(func.vram)) {
+                    manual_patch_syms.emplace_back(func.vram, func.name);
+                }
+            }            
+
+            // Sort the manual patch symbols by vram.
+            std::sort(manual_patch_syms.begin(), manual_patch_syms.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.first < rhs.first;
+            });
+
+            // Emit the manual patch symbols.
+            fmt::print(overlay_file,
+                "\n"
+                "static const ManualPatchSymbol manual_patch_symbols[] = {{\n"
+            );
+            for (const auto& manual_patch_sym_entry : manual_patch_syms) {
+                fmt::print(overlay_file, "    {{ 0x{:08X}, {} }},\n", manual_patch_sym_entry.first, manual_patch_sym_entry.second);
+
+                fmt::print(func_header_file,
+                    "void {}(uint8_t* rdram, recomp_context* ctx);\n", manual_patch_sym_entry.second);
+            }
+            // Add a dummy element at the end to ensure the array has a valid length because C doesn't allow zero-size arrays.
+            fmt::print(overlay_file, "    {{ 0, NULL }}\n");
+            fmt::print(overlay_file, "}};\n");
         }
     }
+
+    fmt::print(func_header_file,
+        "\n"
+        "#ifdef __cplusplus\n"
+        "}}\n"
+        "#endif\n"
+    );
 
     if (!config.output_binary_path.empty()) {
         std::ofstream output_binary{config.output_binary_path, std::ios::binary};

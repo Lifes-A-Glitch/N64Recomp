@@ -1,6 +1,6 @@
-#include "n64recomp.h"
+#include "recompiler/context.h"
 
-const std::unordered_set<std::string> N64Recomp::reimplemented_funcs{
+const std::unordered_set<std::string> N64Recomp::reimplemented_funcs {
     // OS initialize functions
     "__osInitialize_common",
     "osInitialize",
@@ -58,6 +58,7 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs{
     // Parallel interface (cartridge, DMA, etc.) functions
     "osCartRomInit",
     "osCreatePiManager",
+    "osPiReadIo",
     "osPiStartDma",
     "osEPiStartDma",
     "osPiGetStatus",
@@ -93,6 +94,7 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs{
     "osSetEventMesg",
     // Timer functions
     "osGetTime",
+    "osSetTime",
     "osSetTimer",
     "osStopTimer",
     // Voice functions
@@ -113,6 +115,7 @@ const std::unordered_set<std::string> N64Recomp::reimplemented_funcs{
     "osVirtualToPhysical",
     // Coprocessor 0/1 functions
     "osGetCount",
+    "osSetCount",
     "__osSetFpcCsr",
     // Cache funcs
     "osInvalDCache",
@@ -268,7 +271,6 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "__osDevMgrMain",
     "osPiGetCmdQueue",
     "osPiGetStatus",
-    "osPiReadIo",
     "osPiStartDma",
     "osPiWriteIo",
     "osEPiGetDeviceType",
@@ -329,6 +331,7 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "osSetTimer",
     "osStopTimer",
     "osGetTime",
+    "osSetTime",
     "__osInsertTimer",
     "__osTimerInterrupt",
     "__osTimerServicesInit",
@@ -391,6 +394,7 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     // Coprocessor 0/1 functions
     "__osSetCount",
     "osGetCount",
+    "osSetCount",
     "__osSetSR",
     "__osGetSR",
     "__osSetCause",
@@ -557,7 +561,7 @@ const std::unordered_set<std::string> N64Recomp::ignored_funcs {
     "kdebugserver",
 };
 
-const std::unordered_set<std::string> N64Recomp::renamed_funcs{
+const std::unordered_set<std::string> N64Recomp::renamed_funcs {
     // Math
     "sincosf",
     "sinf",

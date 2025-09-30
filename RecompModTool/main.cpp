@@ -7,7 +7,7 @@
 #include <cstdlib>
 #include "fmt/format.h"
 #include "fmt/ostream.h"
-#include "n64recomp.h"
+#include "recompiler/context.h"
 #include <toml++/toml.hpp>
 
 #ifdef _WIN32
@@ -20,21 +20,28 @@
 
 constexpr std::string_view symbol_filename = "mod_syms.bin";
 constexpr std::string_view binary_filename = "mod_binary.bin";
-constexpr std::string_view manifest_filename = "manifest.json";
+constexpr std::string_view manifest_filename = "mod.json";
 
 struct ModManifest {
     std::string mod_id;
     std::string version_string;
+    std::string display_name;
+    std::string description;
+    std::string short_description;
     std::vector<std::string> authors;
     std::string game_id;
     std::string minimum_recomp_version;
     std::unordered_map<std::string, std::vector<std::string>> native_libraries;
+    std::vector<toml::table> config_options;
     std::vector<std::string> dependencies;
     std::vector<std::string> full_dependency_strings;
+    std::vector<std::string> optional_dependencies;
+    std::vector<std::string> full_optional_dependency_strings;
 };
 
 struct ModInputs {
     std::filesystem::path elf_path;
+    std::string mod_filename;
     std::filesystem::path func_reference_syms_file_path;
     std::vector<std::filesystem::path> data_reference_syms_file_paths;
     std::vector<std::filesystem::path> additional_files;
@@ -161,7 +168,7 @@ static T read_toml_value(const toml::table& data, std::string_view key, bool req
 
     if (value_node == nullptr) {
         if (required) {
-            throw toml::parse_error(("Missing required field " + std::string{key}).c_str(), data.source());
+            throw toml::parse_error(("Missing required field \"" + std::string{key} + "\"").c_str(), data.source());
         }
         else {
             return T{};
@@ -173,7 +180,7 @@ static T read_toml_value(const toml::table& data, std::string_view key, bool req
         return opt.value();
     }
     else {
-        throw toml::parse_error(("Incorrect type for field " + std::string{key}).c_str(), data.source());
+        throw toml::parse_error(("Incorrect type for field \"" + std::string{key} + "\"").c_str(), data.source());
     }
 }
 
@@ -214,11 +221,19 @@ static std::vector<std::filesystem::path> get_toml_path_array(const toml::array&
     return ret;
 }
 
+bool validate_config_option(const toml::table& option) {
+    // TODO config option validation.
+    return true;
+}
+
 ModManifest parse_mod_config_manifest(const std::filesystem::path& basedir, const toml::table& manifest_table) {
     ModManifest ret;
 
     // Mod ID
     ret.mod_id = read_toml_value<std::string_view>(manifest_table, "id", true);
+    if (!N64Recomp::validate_mod_id(ret.mod_id)) {
+        throw toml::parse_error("Invalid mod id", manifest_table["id"].node()->source());
+    }
 
     // Mod version
     ret.version_string = read_toml_value<std::string_view>(manifest_table, "version", true);
@@ -226,6 +241,15 @@ ModManifest parse_mod_config_manifest(const std::filesystem::path& basedir, cons
     if (!validate_version_string(ret.version_string, version_has_label)) {
         throw toml::parse_error("Invalid mod version", manifest_table["version"].node()->source());
     }
+
+    // Display name
+    ret.display_name = read_toml_value<std::string_view>(manifest_table, "display_name", true);
+
+    // Description (optional)
+    ret.description = read_toml_value<std::string_view>(manifest_table, "description", false);
+
+    // Short description (optional)
+    ret.short_description = read_toml_value<std::string_view>(manifest_table, "short_description", false);
 
     // Authors
     const toml::array& authors_array = read_toml_array(manifest_table, "authors", true);
@@ -301,6 +325,48 @@ ModManifest parse_mod_config_manifest(const std::filesystem::path& basedir, cons
         });
     }
 
+    // Optional dependency list (optional)
+    const toml::array& optional_dependency_array = read_toml_array(manifest_table, "optional_dependencies", false);
+    if (!optional_dependency_array.empty()) {
+        // Reserve room for all the dependencies.
+        ret.dependencies.reserve(optional_dependency_array.size());
+        optional_dependency_array.for_each([&ret](const auto& el) {
+            if constexpr (toml::is_string<decltype(el)>) {
+                size_t dependency_id_length;
+                bool dependency_version_has_label;
+                if (!validate_dependency_string(el.template ref<std::string>(), dependency_id_length, dependency_version_has_label)) {
+                    throw toml::parse_error("Invalid optional dependency entry", el.source());
+                }
+                if (dependency_version_has_label) {
+                    throw toml::parse_error("Dependency versions may not have labels", el.source());
+                }
+                std::string dependency_id = el.template ref<std::string>().substr(0, dependency_id_length);
+                ret.optional_dependencies.emplace_back(dependency_id);
+                ret.full_optional_dependency_strings.emplace_back(el.template ref<std::string>());
+            }
+            else {
+                throw toml::parse_error("Invalid type for optional dependency entry", el.source());
+            }
+        });
+    }
+
+    // Config schema (optional)
+    const toml::array& config_options_array = read_toml_array(manifest_table, "config_options", false);
+    if (!config_options_array.empty()) {
+        ret.config_options.reserve(config_options_array.size());
+        config_options_array.for_each([&ret](const auto& el) {
+            if constexpr (toml::is_table<decltype(el)>) {
+                if (!validate_config_option(el)) {
+                    throw toml::parse_error("Invalid config option", el.source());
+                }
+                ret.config_options.emplace_back(el);
+            }
+            else {
+                throw toml::parse_error("Invalid type for config option", el.source());
+            }
+        });
+    }
+
     return ret;
 }
 
@@ -314,6 +380,15 @@ ModInputs parse_mod_config_inputs(const std::filesystem::path& basedir, const to
     }
     else {
         throw toml::parse_error("Mod toml input section is missing elf file", inputs_table.source());
+    }
+
+    // Output NRM file
+    std::optional<std::string> mod_filename_opt = inputs_table["mod_filename"].value<std::string>();
+    if (mod_filename_opt.has_value()) {
+        ret.mod_filename = std::move(mod_filename_opt.value());
+    }
+    else {
+        throw toml::parse_error("Mod toml input section is missing the output mod filename", inputs_table.source());
     }
 
     // Function reference symbols file
@@ -416,57 +491,65 @@ bool parse_callback_name(std::string_view data, std::string& dependency_name, st
     return true;
 }
 
-void print_vector_elements(std::ostream& output_file, const std::vector<std::string>& vec, bool compact) {
-    char separator = compact ? ' ' : '\n';
-    for (size_t i = 0; i < vec.size(); i++) {
-        const std::string& val = vec[i];
-        fmt::print(output_file, "{}\"{}\"{}{}",
-            compact ? "" : "        ", val, i == vec.size() - 1 ? "" : ",", separator);
+toml::array string_vector_to_toml(const std::vector<std::string>& input) {
+    toml::array ret{};
+    for (const std::string& str : input) {
+        ret.emplace_back(str);
     }
+    return ret;
 }
 
 void write_manifest(const std::filesystem::path& path, const ModManifest& manifest) {
-    std::ofstream output_file(path);
+    toml::table output_data{};
 
-    fmt::print(output_file,
-        "{{\n"
-        "    \"game_id\": \"{}\",\n"
-        "    \"id\": \"{}\",\n"
-        "    \"version\": \"{}\",\n"
-        "    \"authors\": [\n",
-        manifest.game_id, manifest.mod_id, manifest.version_string);
+    output_data.emplace("game_id", manifest.game_id);
+    output_data.emplace("id", manifest.mod_id);
+    output_data.emplace("version", manifest.version_string);
+    output_data.emplace("display_name", manifest.display_name);
+    
+    if (!manifest.description.empty()) {
+        output_data.emplace("description", manifest.description);
+    }
+    
+    if (!manifest.short_description.empty()) {
+        output_data.emplace("short_description", manifest.short_description);
+    }
 
-    print_vector_elements(output_file, manifest.authors, false);
+    output_data.emplace("authors", string_vector_to_toml(manifest.authors));
 
-    fmt::print(output_file, 
-        "    ],\n"
-        "    \"minimum_recomp_version\": \"{}\"",
-        manifest.minimum_recomp_version);
+    output_data.emplace("minimum_recomp_version", manifest.minimum_recomp_version);
 
     if (!manifest.native_libraries.empty()) {
-        fmt::print(output_file, ",\n"
-            "    \"native_libraries\": {{\n");
+        toml::table libraries_table{};
+
         size_t library_index = 0; 
         for (const auto& [library, funcs] : manifest.native_libraries) {
-            fmt::print(output_file, "        \"{}\": [ ",
-                library);
-            print_vector_elements(output_file, funcs, true);
-            fmt::print(output_file, "]{}\n",
-                library_index == manifest.native_libraries.size() - 1 ? "" : ",");
-            library_index++;
+            libraries_table.emplace(library, string_vector_to_toml(funcs));
         }
-        fmt::print(output_file, "    }}");
+
+        output_data.emplace("native_libraries", std::move(libraries_table));
     }
 
     if (!manifest.full_dependency_strings.empty()) {
-        fmt::print(output_file, ",\n"
-            "    \"dependencies\": [\n");
-        print_vector_elements(output_file, manifest.full_dependency_strings, false);
-        fmt::print(output_file, "    ]");
+        output_data.emplace("dependencies", string_vector_to_toml(manifest.full_dependency_strings));
     }
 
+    if (!manifest.full_optional_dependency_strings.empty()) {
+        output_data.emplace("optional_dependencies", string_vector_to_toml(manifest.full_optional_dependency_strings));
+    }
 
-    fmt::print(output_file, "\n}}\n");
+    if (!manifest.config_options.empty()) {
+        toml::array options_array{};
+        for (const auto& option : manifest.config_options) {
+            options_array.emplace_back(option);
+        }
+        output_data.emplace("config_schema", toml::table{{"options", std::move(options_array)}});
+    }
+
+    toml::json_formatter formatter{output_data, toml::format_flags::indentation | toml::format_flags::indentation};
+    std::ofstream output_file(path);
+
+    output_file << formatter << std::endl;
 }
 
 N64Recomp::Context build_mod_context(const N64Recomp::Context& input_context, bool& good) {
@@ -563,6 +646,8 @@ N64Recomp::Context build_mod_context(const N64Recomp::Context& input_context, bo
         bool event_section = cur_section.name == N64Recomp::EventSectionName;
         bool import_section = cur_section.name.starts_with(N64Recomp::ImportSectionPrefix);
         bool callback_section = cur_section.name.starts_with(N64Recomp::CallbackSectionPrefix);
+        bool hook_section = cur_section.name.starts_with(N64Recomp::HookSectionPrefix);
+        bool hook_return_section = cur_section.name.starts_with(N64Recomp::HookReturnSectionPrefix);
 
         // Add the functions from the current input section to the current output section.
         auto& section_out = ret.sections[output_section_index];
@@ -624,6 +709,42 @@ N64Recomp::Context build_mod_context(const N64Recomp::Context& input_context, bo
                             .original_section_vrom = reference_section_rom,
                             .original_vram = reference_section_vram + reference_symbol.section_offset,
                             .flags = force_patch_section ? N64Recomp::ReplacementFlags::Force : N64Recomp::ReplacementFlags{}
+                        }
+                    );
+                }
+
+                if (hook_section || hook_return_section) {
+                    // Get the name of the hooked function.
+                    size_t section_prefix_length = hook_section ? N64Recomp::HookSectionPrefix.size() : N64Recomp::HookReturnSectionPrefix.size();
+                    std::string hooked_function_name = cur_section.name.substr(section_prefix_length);
+
+                    // Find the corresponding symbol in the reference symbols.
+                    N64Recomp::SymbolReference cur_reference;
+                    bool original_func_exists = input_context.find_regular_reference_symbol(hooked_function_name, cur_reference);
+
+                    // Check that the function being patched exists in the original reference symbols.
+                    if (!original_func_exists) {
+                        fmt::print(stderr, "Function {} hooks a function ({}) that doesn't exist in the original ROM.\n", cur_func.name, hooked_function_name);
+                        return {};
+                    }
+
+                    // Check that the reference symbol is actually a function.
+                    const auto& reference_symbol = input_context.get_reference_symbol(cur_reference);
+                    if (!reference_symbol.is_function) {
+                        fmt::print(stderr, "Function {0} hooks {1}, but {1} was a variable in the original ROM.\n", cur_func.name, hooked_function_name);
+                        return {};
+                    }
+
+                    uint32_t reference_section_vram = input_context.get_reference_section_vram(reference_symbol.section_index);
+                    uint32_t reference_section_rom = input_context.get_reference_section_rom(reference_symbol.section_index);
+
+                    // Add a replacement for this function to the output context.
+                    ret.hooks.emplace_back(
+                        N64Recomp::FunctionHook {
+                            .func_index = (uint32_t)output_func_index,
+                            .original_section_vrom = reference_section_rom,
+                            .original_vram = reference_section_vram + reference_symbol.section_offset,
+                            .flags = hook_return_section ? N64Recomp::HookFlags::AtReturn : N64Recomp::HookFlags{}
                         }
                     );
                 }
@@ -879,16 +1000,16 @@ N64Recomp::Context build_mod_context(const N64Recomp::Context& input_context, bo
 }
 
 bool create_mod_zip(const std::filesystem::path& output_dir, const ModConfig& config) {
-    std::filesystem::path output_path = output_dir / (config.manifest.mod_id + "-" + config.manifest.version_string + ".nrm");
+    std::filesystem::path output_path = output_dir / (config.inputs.mod_filename + ".nrm");
 
 #ifdef _WIN32
     std::filesystem::path temp_zip_path = output_path;
     temp_zip_path.replace_extension(".zip");
-    std::string command_string = fmt::format("powershell -command Compress-Archive -Force -CompressionLevel Optimal -DestinationPath \"{}\" -Path \"{}\",\"{}\",\"{}\"",
+    std::string command_string = fmt::format("powershell -command Compress-Archive -Force -CompressionLevel Optimal -DestinationPath '{}' -Path '{}','{}','{}'",
         temp_zip_path.string(), (output_dir / symbol_filename).string(), (output_dir / binary_filename).string(), (output_dir / manifest_filename).string());
 
     for (const auto& cur_file : config.inputs.additional_files) {
-        command_string += fmt::format(",\"{}\"", cur_file.string());
+        command_string += fmt::format(",'{}'", cur_file.string());
     }
 
     STARTUPINFOA si{};
@@ -1048,8 +1169,9 @@ int main(int argc, const char** argv) {
         }
     }
 
-    // Copy the dependencies from the config into the context.
+    // Copy the dependencies and optional dependencies from the config into the context.
     context.add_dependencies(config.manifest.dependencies);
+    context.add_dependencies(config.manifest.optional_dependencies);
 
     N64Recomp::ElfParsingConfig elf_config {
         .bss_section_suffix = {},
@@ -1059,7 +1181,8 @@ int main(int argc, const char** argv) {
         .entrypoint_address = 0,
         .use_absolute_symbols = false,
         .unpaired_lo16_warnings = false,
-        .all_sections_relocatable = true
+        .all_sections_relocatable = true,
+        .use_mdebug = false,
     };
     bool dummy_found_entrypoint;
     N64Recomp::DataSymbolMap dummy_syms_map;
@@ -1077,6 +1200,11 @@ int main(int argc, const char** argv) {
 
     bool mod_context_good;
     N64Recomp::Context mod_context = build_mod_context(context, mod_context_good);
+    if (!mod_context_good) {
+        fmt::print(stderr, "Failed to create mod context\n");
+        return EXIT_FAILURE;
+    }
+
     std::vector<uint8_t> symbols_bin = N64Recomp::symbols_to_bin_v1(mod_context);
     if (symbols_bin.empty()) {
         fmt::print(stderr, "Failed to create symbol file\n");

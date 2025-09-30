@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <filesystem>
+#include <optional>
 
 #ifdef _MSC_VER
 inline uint32_t byteswap(uint32_t val) {
@@ -35,6 +36,21 @@ namespace N64Recomp {
         Function(uint32_t vram, uint32_t rom, std::vector<uint32_t> words, std::string name, uint16_t section_index, bool ignored = false, bool reimplemented = false, bool stubbed = false)
                 : vram(vram), rom(rom), words(std::move(words)), name(std::move(name)), section_index(section_index), ignored(ignored), reimplemented(reimplemented), stubbed(stubbed) {}
         Function() = default;
+    };
+    
+    struct JumpTable {
+        uint32_t vram;
+        uint32_t addend_reg;
+        uint32_t rom;
+        uint32_t lw_vram;
+        uint32_t addu_vram;
+        uint32_t jr_vram;
+        uint16_t section_index;
+        std::optional<uint32_t> got_offset;
+        std::vector<uint32_t> entries;
+
+        JumpTable(uint32_t vram, uint32_t addend_reg, uint32_t rom, uint32_t lw_vram, uint32_t addu_vram, uint32_t jr_vram, uint16_t section_index, std::optional<uint32_t> got_offset, std::vector<uint32_t>&& entries)
+                : vram(vram), addend_reg(addend_reg), rom(rom), lw_vram(lw_vram), addu_vram(addu_vram), jr_vram(jr_vram), section_index(section_index), got_offset(got_offset), entries(std::move(entries)) {}
     };
 
     enum class RelocType : uint8_t {
@@ -69,6 +85,8 @@ namespace N64Recomp {
     constexpr std::string_view EventSectionName = ".recomp_event";
     constexpr std::string_view ImportSectionPrefix = ".recomp_import.";
     constexpr std::string_view CallbackSectionPrefix = ".recomp_callback.";
+    constexpr std::string_view HookSectionPrefix = ".recomp_hook.";
+    constexpr std::string_view HookReturnSectionPrefix = ".recomp_hook_return.";
 
     // Special dependency names.
     constexpr std::string_view DependencySelf = ".";
@@ -86,6 +104,9 @@ namespace N64Recomp {
         bool executable = false;
         bool relocatable = false; // TODO is this needed? relocs being non-empty should be an equivalent check.
         bool has_mips32_relocs = false;
+        bool fixed_address = false; // Only used in mods, indicates that the section shouldn't be relocated or placed into mod memory.
+        bool globally_loaded = false; // Only used in mods, indicates that the section's functions should be globally loaded. Does not actually load the section's contents into ram.
+        std::optional<uint32_t> got_ram_addr = std::nullopt;
     };
 
     struct ReferenceSection {
@@ -108,11 +129,19 @@ namespace N64Recomp {
         std::unordered_map<std::string, size_t> manually_sized_funcs;
         // The section names that were specified as relocatable
         std::unordered_set<std::string> relocatable_sections;
+        // Symbols to ignore.
+        std::unordered_set<std::string> ignored_syms;
+        // Manual mappings of mdebug file records to elf sections.
+        std::unordered_map<std::string, std::string> mdebug_text_map;
+        std::unordered_map<std::string, std::string> mdebug_data_map;
+        std::unordered_map<std::string, std::string> mdebug_rodata_map;
+        std::unordered_map<std::string, std::string> mdebug_bss_map;
         bool has_entrypoint;
         int32_t entrypoint_address;
         bool use_absolute_symbols;
         bool unpaired_lo16_warnings;
         bool all_sections_relocatable;
+        bool use_mdebug;
     };
     
     struct DataSymbol {
@@ -166,6 +195,19 @@ namespace N64Recomp {
         ReplacementFlags flags;
     };
 
+    enum class HookFlags : uint32_t {
+        AtReturn = 1 << 0,
+    };
+    inline HookFlags operator&(HookFlags lhs, HookFlags rhs) { return HookFlags(uint32_t(lhs) & uint32_t(rhs)); }
+    inline HookFlags operator|(HookFlags lhs, HookFlags rhs) { return HookFlags(uint32_t(lhs) | uint32_t(rhs)); }
+
+    struct FunctionHook {
+        uint32_t func_index;
+        uint32_t original_section_vrom;
+        uint32_t original_vram;
+        HookFlags flags;
+    };
+
     class Context {
     private:
         //// Reference symbols (used for populating relocations for patches)
@@ -175,6 +217,8 @@ namespace N64Recomp {
         std::vector<ReferenceSymbol> reference_symbols;
         // Mapping of symbol name to reference symbol index.
         std::unordered_map<std::string, SymbolReference> reference_symbols_by_name;
+        // Whether all reference sections should be treated as relocatable (used in live recompilation).
+        bool all_reference_sections_relocatable = false;
     public:
         std::vector<Section> sections;
         std::vector<Function> functions;
@@ -187,6 +231,10 @@ namespace N64Recomp {
         // The target ROM being recompiled, TODO move this outside of the context to avoid making a copy for mod contexts.
         // Used for reading relocations and for the output binary feature.
         std::vector<uint8_t> rom;
+        // Whether reference symbols should be validated when emitting function calls during recompilation.
+        bool skip_validating_reference_symbols = true;
+        // Whether all function calls (excluding reference symbols) should go through lookup.
+        bool use_lookup_for_all_function_calls = false;
 
         //// Only used by the CLI, TODO move this to a struct in the internal headers.
         // A mapping of function name to index in the functions vector
@@ -195,6 +243,8 @@ namespace N64Recomp {
         //// Mod dependencies and their symbols
         
         //// Imported values
+        // Dependency names.
+        std::vector<std::string> dependencies;
         // Mapping of dependency name to dependency index.
         std::unordered_map<std::string, size_t> dependencies_by_name;
         // List of symbols imported from dependencies.
@@ -215,6 +265,11 @@ namespace N64Recomp {
         std::vector<Callback> callbacks;
         // List of symbols from events, which contains the names of events that this context provides.
         std::vector<EventSymbol> event_symbols;
+        // List of hooks, which contains the original function to hook and the function index to call at the hook.
+        std::vector<FunctionHook> hooks;
+
+        // Causes functions to print their name to the console the first time they're called.
+        bool trace_mode;
 
         // Imports sections and function symbols from a provided context into this context's reference sections and reference functions.
         bool import_reference_context(const Context& reference_context);
@@ -233,6 +288,7 @@ namespace N64Recomp {
 
             size_t dependency_index = dependencies_by_name.size();
 
+            dependencies.emplace_back(id);
             dependencies_by_name.emplace(id, dependency_index);
             dependency_events_by_name.resize(dependencies_by_name.size());
             dependency_imports_by_name.resize(dependencies_by_name.size());
@@ -252,6 +308,7 @@ namespace N64Recomp {
 
             for (const std::string& dep : new_dependencies) {
                 size_t dependency_index = dependencies_by_name.size();
+                dependencies.emplace_back(dep);
                 dependencies_by_name.emplace(dep, dependency_index);
             }
 
@@ -356,6 +413,9 @@ namespace N64Recomp {
         }
 
         bool is_reference_section_relocatable(uint16_t section_index) const {
+            if (all_reference_sections_relocatable) {
+                return true;
+            }
             if (section_index == SectionAbsolute) {
                 return false;
             }
@@ -515,9 +575,16 @@ namespace N64Recomp {
         void copy_reference_sections_from(const Context& rhs) {
             reference_sections = rhs.reference_sections;
         }
+
+        void set_all_reference_sections_relocatable() {
+            all_reference_sections_relocatable = true;
+        }
+
     };
 
-    bool recompile_function(const Context& context, const Function& func, std::ofstream& output_file, std::span<std::vector<uint32_t>> static_funcs, bool tag_reference_relocs);
+    class Generator;
+    bool recompile_function(const Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs, bool tag_reference_relocs);
+    bool recompile_function_custom(Generator& generator, const Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs);
 
     enum class ModSymbolsError {
         Good,
@@ -529,6 +596,22 @@ namespace N64Recomp {
 
     ModSymbolsError parse_mod_symbols(std::span<const char> data, std::span<const uint8_t> binary, const std::unordered_map<uint32_t, uint16_t>& sections_by_vrom, Context& context_out);
     std::vector<uint8_t> symbols_to_bin_v1(const Context& mod_context);
+    
+    inline bool is_manual_patch_symbol(uint32_t vram) {
+        // Zero-sized symbols between 0x8F000000 and 0x90000000 are manually specified symbols for use with patches.
+        // TODO make this configurable or come up with a more sensible solution for dealing with manual symbols for patches.
+        return vram >= 0x8F000000 && vram < 0x90000000;
+    }
+
+    // Locale-independent ASCII-only version of isalpha.
+    inline bool isalpha_nolocale(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+    
+    // Locale-independent ASCII-only version of isalnum.
+    inline bool isalnum_nolocale(char c) {
+        return isalpha_nolocale(c) || (c >= '0' && c <= '9');
+    }
 
     inline bool validate_mod_id(std::string_view str) {
         // Disallow empty ids.
@@ -545,13 +628,13 @@ namespace N64Recomp {
         // so this is just to prevent "weird" mod ids.
 
         // Check the first character, which must be alphabetical or an underscore.
-        if (!isalpha(str[0]) && str[0] != '_') {
+        if (!isalpha_nolocale(str[0]) && str[0] != '_') {
             return false;
         }
 
         // Check the remaining characters, which can be alphanumeric or underscore.
         for (char c : str.substr(1)) {
-            if (!isalnum(c) && c != '_') {
+            if (!isalnum_nolocale(c) && c != '_') {
                 return false;
             }
         }

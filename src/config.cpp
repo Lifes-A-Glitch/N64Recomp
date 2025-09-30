@@ -3,7 +3,7 @@
 #include <toml++/toml.hpp>
 #include "fmt/format.h"
 #include "config.h"
-#include "n64recomp.h"
+#include "recompiler/context.h"
 
 std::filesystem::path concat_if_not_empty(const std::filesystem::path& parent, const std::filesystem::path& child) {
     if (!child.empty()) {
@@ -93,7 +93,7 @@ std::vector<std::string> get_ignored_funcs(const toml::table* patches_data) {
         // Make room for all the ignored funcs in the array.
         ignored_funcs.reserve(ignored_funcs_array->size());
 
-        // Gather the stubs and place them into the array.
+        // Gather the ignored and place them into the array.
         ignored_funcs_array->for_each([&ignored_funcs](auto&& el) {
             if constexpr (toml::is_string<decltype(el)>) {
                 ignored_funcs.push_back(*el);
@@ -104,41 +104,55 @@ std::vector<std::string> get_ignored_funcs(const toml::table* patches_data) {
     return ignored_funcs;
 }
 
-std::vector<N64Recomp::FunctionSize> get_func_sizes(const toml::table* patches_data) {
-    std::vector<N64Recomp::FunctionSize> func_sizes{};
+std::vector<std::string> get_renamed_funcs(const toml::table* patches_data) {
+    std::vector<std::string> renamed_funcs{};
 
-    // Check if the func size array exists.
-    const toml::node_view funcs_data = (*patches_data)["function_sizes"];
-    if (funcs_data.is_array()) {
-        const toml::array* sizes_array = funcs_data.as_array();
+    // Check if the renamed funcs array exists.
+    const toml::node_view renamed_funcs_data = (*patches_data)["renamed"];
 
-        // Copy all the sizes into the output vector.
-        sizes_array->for_each([&func_sizes](auto&& el) {
-            if constexpr (toml::is_table<decltype(el)>) {
-                const toml::table& cur_size = *el.as_table();
+    if (renamed_funcs_data.is_array()) {
+        const toml::array* renamed_funcs_array = renamed_funcs_data.as_array();
 
-                // Get the function name and size.
-                std::optional<std::string> func_name = cur_size["name"].value<std::string>();
-                std::optional<uint32_t> func_size = cur_size["size"].value<uint32_t>();
+        // Make room for all the renamed funcs in the array.
+        renamed_funcs.reserve(renamed_funcs_array->size());
 
-                if (func_name.has_value() && func_size.has_value()) {
-                    // Make sure the size is divisible by 4
-                    if (func_size.value() & (4 - 1)) {
-                        // It's not, so throw an error (and make it look like a normal toml one).
-                        throw toml::parse_error("Function size is not divisible by 4", el.source());
-                    }
-                }
-                else {
-                    throw toml::parse_error("Manually size function is missing required value(s)", el.source());
-                }
-
-                func_sizes.emplace_back(func_name.value(), func_size.value());
-            }
-            else {
-                throw toml::parse_error("Invalid manually sized function entry", el.source());
+        // Gather the renamed and place them into the array.
+        renamed_funcs_array->for_each([&renamed_funcs](auto&& el) {
+            if constexpr (toml::is_string<decltype(el)>) {
+                renamed_funcs.push_back(*el);
             }
         });
     }
+
+    return renamed_funcs;
+}
+
+std::vector<N64Recomp::FunctionSize> get_func_sizes(const toml::array* func_sizes_array) {
+    std::vector<N64Recomp::FunctionSize> func_sizes{};
+
+    // Reserve room for all the funcs in the map.
+    func_sizes.reserve(func_sizes_array->size());
+    func_sizes_array->for_each([&func_sizes](auto&& el) {
+        if constexpr (toml::is_table<decltype(el)>) {
+            std::optional<std::string> func_name = el["name"].template value<std::string>();
+            std::optional<uint32_t> func_size = el["size"].template value<uint32_t>();
+
+            if (func_name.has_value() && func_size.has_value()) {
+                // Make sure the size is divisible by 4
+                if (func_size.value() & (4 - 1)) {
+                    // It's not, so throw an error (and make it look like a normal toml one).
+                    throw toml::parse_error("Function size is not divisible by 4", el.source());
+                }
+                func_sizes.emplace_back(func_name.value(), func_size.value());
+            }
+            else {
+                throw toml::parse_error("Manually sized function is missing required value(s)", el.source());
+            }
+        }
+        else {
+            throw toml::parse_error("Missing required value in function_sizes array", el.source());
+        }
+    });
 
     return func_sizes;
 }
@@ -187,8 +201,8 @@ std::vector<N64Recomp::InstructionPatch> get_instruction_patches(const toml::tab
     return ret;
 }
 
-std::vector<N64Recomp::FunctionHook> get_function_hooks(const toml::table* patches_data) {
-    std::vector<N64Recomp::FunctionHook> ret;
+std::vector<N64Recomp::FunctionTextHook> get_function_hooks(const toml::table* patches_data) {
+    std::vector<N64Recomp::FunctionTextHook> ret;
 
     // Check if the function hook array exists.
     const toml::node_view func_hook_data = (*patches_data)["hook"];
@@ -216,7 +230,7 @@ std::vector<N64Recomp::FunctionHook> get_function_hooks(const toml::table* patch
                     throw toml::parse_error("before_vram is not word-aligned", el.source());
                 }
 
-                ret.push_back(N64Recomp::FunctionHook{
+                ret.push_back(N64Recomp::FunctionTextHook{
                     .func_name = func_name.value(),
                     .before_vram = before_vram.has_value() ? (int32_t)before_vram.value() : 0,
                     .text = text.value(),
@@ -229,6 +243,46 @@ std::vector<N64Recomp::FunctionHook> get_function_hooks(const toml::table* patch
     }
 
     return ret;
+}
+
+void get_mdebug_mappings(const toml::array* mdebug_mappings_array,
+    std::unordered_map<std::string, std::string>& mdebug_text_map,
+    std::unordered_map<std::string, std::string>& mdebug_data_map,
+    std::unordered_map<std::string, std::string>& mdebug_rodata_map,
+    std::unordered_map<std::string, std::string>& mdebug_bss_map
+) {
+    mdebug_mappings_array->for_each([&mdebug_text_map, &mdebug_data_map, &mdebug_rodata_map, &mdebug_bss_map](auto&& el) {
+        if constexpr (toml::is_table<decltype(el)>) {
+            std::optional<std::string> filename = el["filename"].template value<std::string>();
+            std::optional<std::string> input_section = el["input_section"].template value<std::string>();
+            std::optional<std::string> output_section = el["output_section"].template value<std::string>();
+
+            if (filename.has_value() && input_section.has_value() && output_section.has_value()) {
+                const std::string& input_section_val = input_section.value();
+                if (input_section_val == ".text") {
+                    mdebug_text_map.emplace(filename.value(), output_section.value());
+                }
+                else if (input_section_val == ".data") {
+                    mdebug_data_map.emplace(filename.value(), output_section.value());
+                }
+                else if (input_section_val == ".rodata") {
+                    mdebug_rodata_map.emplace(filename.value(), output_section.value());
+                }
+                else if (input_section_val == ".bss") {
+                    mdebug_bss_map.emplace(filename.value(), output_section.value());
+                }
+                else {
+                    throw toml::parse_error("Invalid input section in mdebug file mapping entry", el.source());
+                }
+            }
+            else {
+                throw toml::parse_error("Mdebug file mappings entry is missing required value(s)", el.source());
+            }
+        }
+        else {
+            throw toml::parse_error("Invalid mdebug file mappings entry", el.source());
+        }
+    });
 }
 
 N64Recomp::Config::Config(const char* path) {
@@ -329,6 +383,13 @@ N64Recomp::Config::Config(const char* path) {
             manual_functions = get_manual_funcs(array);
         }
 
+        // Manual function sizes (optional)
+        toml::node_view function_sizes_data = input_data["function_sizes"];
+        if (function_sizes_data.is_array()) {
+            const toml::array* array = function_sizes_data.as_array();
+            manual_func_sizes = get_func_sizes(array);
+        }
+
         // Output binary path when using an elf file input, includes patching reference symbol MIPS32 relocs (optional)
         std::optional<std::string> output_binary_path_opt = input_data["output_binary_path"].value<std::string>();
         if (output_binary_path_opt.has_value()) {
@@ -347,12 +408,28 @@ N64Recomp::Config::Config(const char* path) {
             unpaired_lo16_warnings = true;
         }
 
+        // Control whether the recompiler should look for and parse mdebug (optional, defaults to false)
+        std::optional<bool> use_mdebug_opt = input_data["use_mdebug"].value<bool>();
+        if (use_mdebug_opt.has_value()) {
+            use_mdebug = use_mdebug_opt.value();
+        }
+        else {
+            use_mdebug = false;
+        }
+
+        // Symbols to ignore when parsing mdebug (option, defaults to empty)
+        toml::node_view mdebug_mappings_data = input_data["mdebug_file_mappings"];
+        if (mdebug_mappings_data.is_array()) {
+            get_mdebug_mappings(mdebug_mappings_data.as_array(),
+                mdebug_text_map, mdebug_data_map, mdebug_rodata_map, mdebug_bss_map);
+        }
+
         std::optional<std::string> recomp_include_opt = input_data["recomp_include"].value<std::string>();
         if (recomp_include_opt.has_value()) {
             recomp_include = recomp_include_opt.value();
         }
         else {
-            recomp_include = "#include \"librecomp/recomp.h\"";
+            recomp_include = "#include \"recomp.h\"";
         }
 
         std::optional<int32_t> funcs_per_file_opt = input_data["functions_per_output_file"].value<int32_t>();
@@ -377,14 +454,26 @@ N64Recomp::Config::Config(const char* path) {
             // Ignored funcs array (optional)
             ignored_funcs = get_ignored_funcs(table);
 
+            // Renamed funcs array (optional)
+            renamed_funcs = get_renamed_funcs(table);
+
             // Single-instruction patches (optional)
             instruction_patches = get_instruction_patches(table);
 
-            // Manual function sizes (optional)
-            manual_func_sizes = get_func_sizes(table);
-
             // Function hooks (optional)
             function_hooks = get_function_hooks(table);
+        }
+
+        // Use trace mode if enabled (optional)
+        std::optional<bool> trace_mode_opt = input_data["trace_mode"].value<bool>();
+        if (trace_mode_opt.has_value()) {
+            trace_mode = trace_mode_opt.value();
+            if (trace_mode) {
+                recomp_include += "\n#include \"trace.h\"";
+            }
+        }
+        else {
+            trace_mode = false;
         }
 
         // Function reference symbols file (optional)
@@ -476,6 +565,7 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
                 std::optional<uint32_t> vram_addr = el["vram"].template value<uint32_t>();
                 std::optional<uint32_t> size = el["size"].template value<uint32_t>();
                 std::optional<std::string> name = el["name"].template value<std::string>();
+                std::optional<uint32_t> got_ram_addr = el["got_address"].template value<uint32_t>();
 
                 if (!rom_addr.has_value() || !vram_addr.has_value() || !size.has_value() || !name.has_value()) {
                     throw toml::parse_error("Section entry missing required field(s)", el.source());
@@ -488,6 +578,7 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
                 section.ram_addr = vram_addr.value();
                 section.size = size.value();
                 section.name = name.value();
+                section.got_ram_addr = got_ram_addr;
                 section.executable = true;
 
                 // Read functions for the section.
@@ -574,7 +665,7 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
 
                                 RelocType reloc_type = reloc_type_from_name(type_string.value());
 
-                                if (reloc_type != RelocType::R_MIPS_HI16 && reloc_type != RelocType::R_MIPS_LO16 && reloc_type != RelocType::R_MIPS_32) {
+                                if (reloc_type != RelocType::R_MIPS_HI16 && reloc_type != RelocType::R_MIPS_LO16 && reloc_type != RelocType::R_MIPS_26 && reloc_type != RelocType::R_MIPS_32) {
                                     throw toml::parse_error("Invalid reloc entry type", reloc_el.source());
                                 }
 
